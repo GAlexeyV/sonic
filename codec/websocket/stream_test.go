@@ -10,9 +10,11 @@ import (
 	"net"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/talostrading/sonic"
+	"github.com/talostrading/sonic/sonicopts"
 )
 
 func assertState(t *testing.T, ws *Stream, expected StreamState) {
@@ -2038,4 +2040,181 @@ func TestServerAcceptWrongRole(t *testing.T) {
 
 	err = client.Accept(nil)
 	assert.Equal(ErrWrongHandshakeRole, err)
+}
+
+func TestServerAcceptReal(t *testing.T) {
+	assert := assert.New(t)
+
+	ioc := sonic.MustIO()
+	defer ioc.Close()
+
+	ln, err := sonic.Listen(ioc, "tcp", "localhost:0", sonicopts.Nonblocking(true))
+	assert.Nil(err)
+	defer ln.Close()
+
+	addr := ln.Addr().String()
+
+	// Connect a client
+	var clientConn net.Conn
+	var clientErr error
+	doneConnect := make(chan struct{})
+	go func() {
+		clientConn, clientErr = net.Dial("tcp", addr)
+		close(doneConnect)
+	}()
+	select {
+	case <-doneConnect:
+	case <-time.After(2 * time.Second):
+		assert.FailNow("client connect timed out")
+	}
+	if clientErr != nil {
+		fmt.Println("Client connect error:", clientErr)
+	}
+	assert.Nil(clientErr)
+	defer clientConn.Close()
+
+	// Send WebSocket upgrade request from client
+	clientKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	upgradeReq := fmt.Sprintf(
+		"GET / HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Key: %s\r\n"+
+			"Sec-WebSocket-Version: 13\r\n"+
+			"\r\n",
+		addr, clientKey)
+	_, err = clientConn.Write([]byte(upgradeReq))
+	assert.Nil(err)
+
+	// Accept the connection
+	conn, err := ln.Accept()
+	assert.Nil(err)
+	defer conn.Close()
+
+	ioc2 := sonic.MustIO()
+	defer ioc2.Close()
+
+	ws, err := NewWebsocketStream(ioc2, nil, RoleServer)
+	assert.Nil(err)
+
+	done := make(chan struct{})
+	ws.AsyncAccept(conn, func(err error) {
+		assert.Nil(err)
+		assertState(t, ws, StateActive)
+		close(done)
+	})
+
+	// Run the IOC to process the handshake
+	for i := 0; i < 100; i++ {
+		ioc2.PollOne()
+		select {
+		case <-done:
+			return
+		default:
+		}
+	}
+	assertState(t, ws, StateActive)
+}
+
+func TestServerAsyncAcceptReal(t *testing.T) {
+	assert := assert.New(t)
+
+	ioc := sonic.MustIO()
+	defer ioc.Close()
+
+	ln, err := sonic.Listen(ioc, "tcp", "localhost:0", sonicopts.Nonblocking(true))
+	assert.Nil(err)
+	defer ln.Close()
+
+	addr := ln.Addr().String()
+
+	// Connect a client
+	var clientConn net.Conn
+	var clientErr error
+	doneConnect := make(chan struct{})
+	go func() {
+		clientConn, clientErr = net.Dial("tcp", addr)
+		close(doneConnect)
+	}()
+	select {
+	case <-doneConnect:
+	case <-time.After(2 * time.Second):
+		assert.FailNow("client connect timed out")
+	}
+	if clientErr != nil {
+		fmt.Println("Client connect error:", clientErr)
+	}
+	assert.Nil(clientErr)
+	defer clientConn.Close()
+
+	// Send WebSocket upgrade request from client
+	clientKey := "dGhlIHNhbXBsZSBub25jZQ=="
+	upgradeReq := fmt.Sprintf(
+		"GET / HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Key: %s\r\n"+
+			"Sec-WebSocket-Version: 13\r\n"+
+			"\r\n",
+		addr, clientKey)
+	_, err = clientConn.Write([]byte(upgradeReq))
+	assert.Nil(err)
+
+	// Accept the connection asynchronously
+	var acceptedConn sonic.Conn
+	var acceptErr error
+	acceptDone := make(chan struct{})
+
+	var onAccept sonic.AcceptCallback
+	onAccept = func(err error, conn sonic.Conn) {
+		if err != nil {
+			acceptErr = err
+			close(acceptDone)
+			return
+		}
+		acceptedConn = conn
+
+		// Accept next connection
+		ln.AsyncAccept(onAccept)
+
+		// Create WebSocket stream and perform handshake
+		ioc2 := sonic.MustIO()
+		defer ioc2.Close()
+
+		ws, err := NewWebsocketStream(ioc2, nil, RoleServer)
+		assert.Nil(err)
+
+		done := make(chan struct{})
+		ws.AsyncAccept(conn, func(err error) {
+			assert.Nil(err)
+			assertState(t, ws, StateActive)
+			close(done)
+		})
+
+		for i := 0; i < 100; i++ {
+			ioc2.PollOne()
+			select {
+			case <-done:
+				close(acceptDone)
+				return
+			default:
+			}
+		}
+	}
+
+	ln.AsyncAccept(onAccept)
+
+	// Run IOC to process accept
+	for i := 0; i < 100; i++ {
+		ioc.PollOne()
+		select {
+		case <-acceptDone:
+			return
+		default:
+		}
+	}
+	assert.Nil(acceptErr)
+	assert.NotNil(acceptedConn)
 }
